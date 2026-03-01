@@ -58,6 +58,9 @@ function connect() {
 
     ws.on('ping', () => ws.pong());
 
+    const localWebSockets = new Map(); // connectionId → WebSocket (established)
+    const pendingWsConnections = new Map(); // connectionId → { localWs, buffer }
+
     ws.on('message', (data) => {
         let msg;
         try { msg = JSON.parse(data); }
@@ -148,9 +151,163 @@ function connect() {
             if (msg.body) localReq.write(Buffer.from(msg.body, 'base64'));
             localReq.end();
         }
+
+        if (msg.type === 'ws-connect') {
+            if (!msg.connectionId || !msg.path) {
+                console.error('Received ws-connect with missing connectionId or path — ignoring');
+                return;
+            }
+
+            const url = `ws://localhost:${LOCAL_PORT}${msg.path}`;
+            const headers = { ...msg.headers };
+            if (rewriteHost) {
+                headers['host'] = `localhost:${LOCAL_PORT}`;
+            }
+
+            console.log(`[ws] connectionId=${msg.connectionId} connecting to ${url}`);
+
+            const localWs = new WebSocket(url, { headers });
+            const frameBuffer = [];
+            pendingWsConnections.set(msg.connectionId, { localWs, buffer: frameBuffer });
+
+            localWs.on('open', () => {
+                const responseHeaders = localWs.protocol ? { 'Sec-WebSocket-Protocol': localWs.protocol } : {};
+                try {
+                    ws.send(JSON.stringify({
+                        type: 'ws-connect-response',
+                        connectionId: msg.connectionId,
+                        status: 101,
+                        headers: { Upgrade: 'websocket', Connection: 'Upgrade', ...responseHeaders }
+                    }));
+                } catch (e) {
+                    console.error('Failed to send ws-connect-response:', e.message);
+                    localWs.close();
+                    pendingWsConnections.delete(msg.connectionId);
+                    return;
+                }
+                localWebSockets.set(msg.connectionId, localWs);
+                pendingWsConnections.delete(msg.connectionId);
+                for (const frame of frameBuffer) {
+                    try {
+                        localWs.send(Buffer.from(frame.data, 'base64'), { binary: frame.isBinary });
+                    } catch (e) {
+                        try { ws.send(JSON.stringify({ type: 'ws-close', connectionId: msg.connectionId, code: 1011, reason: 'Send failed' })); } catch {}
+                        localWebSockets.delete(msg.connectionId);
+                        return;
+                    }
+                }
+            });
+
+            localWs.on('message', (data, isBinary) => {
+                try {
+                    ws.send(JSON.stringify({
+                        type: 'ws-frame',
+                        connectionId: msg.connectionId,
+                        isBinary: !!isBinary,
+                        data: (Buffer.isBuffer(data) ? data : Buffer.from(data)).toString('base64')
+                    }));
+                } catch (e) {
+                    console.error('Failed to send ws-frame:', e.message);
+                    try { localWs.close(); } catch {}
+                }
+            });
+
+            localWs.on('close', (code, reason) => {
+                const wasPending = pendingWsConnections.has(msg.connectionId);
+                pendingWsConnections.delete(msg.connectionId);
+                localWebSockets.delete(msg.connectionId);
+
+                if (wasPending) {
+                    try {
+                        ws.send(JSON.stringify({
+                            type: 'ws-connect-response',
+                            connectionId: msg.connectionId,
+                            status: 502,
+                            headers: { 'Content-Type': 'text/plain' },
+                            body: Buffer.from(`Connection closed before handshake (code=${code})`).toString('base64')
+                        }));
+                    } catch {}
+                } else {
+                    try {
+                        ws.send(JSON.stringify({
+                            type: 'ws-close',
+                            connectionId: msg.connectionId,
+                            code,
+                            reason: (reason && reason.toString) ? reason.toString() : (reason || '')
+                        }));
+                    } catch {}
+                }
+                console.log(`[ws] connectionId=${msg.connectionId} closed by local server (code=${code})`);
+            });
+
+            localWs.on('error', (err) => {
+                const errMsg = err.message || 'Connection failed';
+                try {
+                    ws.send(JSON.stringify({
+                        type: 'ws-connect-response',
+                        connectionId: msg.connectionId,
+                        status: 502,
+                        headers: { 'Content-Type': 'text/plain' },
+                        body: Buffer.from(`Bad Gateway: ${errMsg}`).toString('base64')
+                    }));
+                } catch (e) {
+                    console.error('Failed to send ws-connect-response (error):', e.message);
+                }
+                localWebSockets.delete(msg.connectionId);
+                pendingWsConnections.delete(msg.connectionId);
+                console.log(`[ws] connectionId=${msg.connectionId} error: ${errMsg}`);
+            });
+        }
+
+        if (msg.type === 'ws-frame') {
+            const localWs = localWebSockets.get(msg.connectionId);
+            if (localWs) {
+                try {
+                    if (localWs.readyState === WebSocket.OPEN) {
+                        localWs.send(Buffer.from(msg.data || '', 'base64'), { binary: !!msg.isBinary });
+                    }
+                } catch (e) {
+                    try { ws.send(JSON.stringify({ type: 'ws-close', connectionId: msg.connectionId, code: 1011, reason: 'Send failed' })); } catch {}
+                    localWebSockets.delete(msg.connectionId);
+                }
+            } else {
+                const pending = pendingWsConnections.get(msg.connectionId);
+                if (pending) {
+                    pending.buffer.push({ isBinary: !!msg.isBinary, data: msg.data });
+                }
+            }
+        }
+
+        if (msg.type === 'ws-close') {
+            const localWs = localWebSockets.get(msg.connectionId);
+            const pending = pendingWsConnections.get(msg.connectionId);
+            pendingWsConnections.delete(msg.connectionId);
+            if (localWs) {
+                try {
+                    if (localWs.readyState === WebSocket.OPEN || localWs.readyState === WebSocket.CLOSING) {
+                        localWs.close(msg.code || 1000, msg.reason || '');
+                    }
+                } catch {}
+                localWebSockets.delete(msg.connectionId);
+                console.log(`[ws] connectionId=${msg.connectionId} closed by server (code=${msg.code})`);
+            } else if (pending) {
+                try {
+                    pending.localWs.close(msg.code || 1000, msg.reason || '');
+                } catch {}
+                console.log(`[ws] connectionId=${msg.connectionId} closed by server while connecting (code=${msg.code})`);
+            }
+        }
     });
 
     ws.on('close', (code, reason) => {
+        for (const [, localWs] of localWebSockets) {
+            try { localWs.close(1011, 'Tunnel disconnected'); } catch {}
+        }
+        for (const [, pending] of pendingWsConnections) {
+            try { pending.localWs.close(1011, 'Tunnel disconnected'); } catch {}
+        }
+        localWebSockets.clear();
+        pendingWsConnections.clear();
         if (code === 1008) {
             console.error(`\nConnection permanently rejected by server. Exiting.`);
             process.exit(1);

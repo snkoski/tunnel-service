@@ -6,6 +6,8 @@ const TUNNEL_SECRET = process.env.TUNNEL_SECRET;
 const REQUEST_TIMEOUT_MS = 30_000;
 const HEARTBEAT_INTERVAL_MS = 30_000;
 const MAX_BODY_BYTES = 10 * 1024 * 1024; // 10MB
+const WS_CONNECT_TIMEOUT_MS = 10_000;
+const MAX_WS_CONNECTIONS_PER_TUNNEL = 50;
 const SUBDOMAIN_REGEX = /^[a-z0-9][a-z0-9-]{0,62}$/;
 
 if (!TUNNEL_SECRET) {
@@ -16,6 +18,8 @@ if (!TUNNEL_SECRET) {
 const tunnels = new Map();         // subdomain  → WebSocket
 const pendingRequests = new Map(); // requestId  → { res, timer, subdomain }
 const tunnelRequests = new Map();  // subdomain  → Set<requestId>
+const publicWebSockets = new Map(); // connectionId → { publicWs, subdomain, buffer, pending, timeout }
+const tunnelWebSockets = new Map(); // subdomain → Set<connectionId>
 
 function constantTimeEqual(a, b) {
     if (typeof a !== 'string' || typeof b !== 'string') return false;
@@ -30,6 +34,100 @@ function generateSubdomain() {
     do { sub = crypto.randomBytes(4).toString('hex'); }
     while (tunnels.has(sub));
     return sub;
+}
+
+function handleWebSocketUpgrade(req, socket, head, wssPublic) {
+    const subdomain = req.headers.host?.split('.')[0];
+    const tunnelWs = tunnels.get(subdomain);
+
+    if (!tunnelWs || tunnelWs.readyState !== WebSocket.OPEN) {
+        socket.destroy();
+        return;
+    }
+
+    const connSet = tunnelWebSockets.get(subdomain);
+    if (connSet && connSet.size >= MAX_WS_CONNECTIONS_PER_TUNNEL) {
+        socket.write('HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nToo many WebSocket connections');
+        socket.destroy();
+        return;
+    }
+
+    const connectionId = crypto.randomUUID();
+    console.log(`[ws] connectionId=${connectionId} upgrade request for ${subdomain}${req.url}`);
+
+    wssPublic.handleUpgrade(req, socket, head, (publicWs) => {
+        const entry = {
+            publicWs,
+            subdomain,
+            buffer: [],
+            pending: true,
+            timeout: setTimeout(() => {
+                entry.timeout = null;
+                entry.pending = false;
+                try {
+                    publicWs.close(1011, 'Local connection timeout');
+                } catch {}
+                publicWebSockets.delete(connectionId);
+                tunnelWebSockets.get(subdomain)?.delete(connectionId);
+                try {
+                    tunnelWs.send(JSON.stringify({ type: 'ws-close', connectionId, code: 1011, reason: 'Timeout' }));
+                } catch {}
+                console.log(`[ws] connectionId=${connectionId} timeout`);
+            }, WS_CONNECT_TIMEOUT_MS)
+        };
+        publicWebSockets.set(connectionId, entry);
+        tunnelWebSockets.get(subdomain)?.add(connectionId);
+
+        publicWs.on('message', (data, isBinary) => {
+            const e = publicWebSockets.get(connectionId);
+            if (!e) return;
+            const payload = {
+                type: 'ws-frame',
+                connectionId,
+                isBinary: !!isBinary,
+                data: (Buffer.isBuffer(data) ? data : Buffer.from(data)).toString('base64')
+            };
+            if (e.pending) {
+                e.buffer.push({ isBinary: !!isBinary, data: payload.data });
+            } else {
+                try {
+                    tunnelWs.send(JSON.stringify(payload));
+                } catch (err) {
+                    try { publicWs.close(1011, 'Tunnel send failed'); } catch {}
+                }
+            }
+        });
+
+        publicWs.on('close', (code, reason) => {
+            try {
+                tunnelWs.send(JSON.stringify({
+                    type: 'ws-close',
+                    connectionId,
+                    code,
+                    reason: (reason && reason.toString) ? reason.toString() : (reason || '')
+                }));
+            } catch {}
+            const e = publicWebSockets.get(connectionId);
+            if (e) clearTimeout(e.timeout);
+            publicWebSockets.delete(connectionId);
+            tunnelWebSockets.get(subdomain)?.delete(connectionId);
+            console.log(`[ws] connectionId=${connectionId} closed by public client (code=${code})`);
+        });
+
+        try {
+            tunnelWs.send(JSON.stringify({
+                type: 'ws-connect',
+                connectionId,
+                path: req.url,
+                headers: req.headers
+            }));
+        } catch (err) {
+            clearTimeout(entry.timeout);
+            try { publicWs.close(1011, 'Tunnel send failed'); } catch {}
+            publicWebSockets.delete(connectionId);
+            tunnelWebSockets.get(subdomain)?.delete(connectionId);
+        }
+    });
 }
 
 // --- Control port (4001): Accept and authenticate tunnel clients ---
@@ -78,6 +176,7 @@ controlServer.on('connection', (ws) => {
             authenticated = true;
             tunnels.set(subdomain, ws);
             tunnelRequests.set(subdomain, new Set());
+            tunnelWebSockets.set(subdomain, new Set());
 
             ws.send(JSON.stringify({ type: 'registered', subdomain }));
             console.log(`[+] Tunnel registered: ${subdomain}`);
@@ -113,6 +212,21 @@ controlServer.on('connection', (ws) => {
                     }
                 }
                 tunnelRequests.delete(subdomain);
+
+                const connIds = tunnelWebSockets.get(subdomain) || new Set();
+                for (const connectionId of connIds) {
+                    const entry = publicWebSockets.get(connectionId);
+                    if (entry) {
+                        clearTimeout(entry.timeout);
+                        try {
+                            if (entry.publicWs.readyState === WebSocket.OPEN || entry.publicWs.readyState === WebSocket.CLOSING) {
+                                entry.publicWs.close(1011, 'Tunnel client disconnected');
+                            }
+                        } catch {}
+                        publicWebSockets.delete(connectionId);
+                    }
+                }
+                tunnelWebSockets.delete(subdomain);
                 console.log(`[-] Tunnel closed: ${subdomain}`);
             });
 
@@ -144,10 +258,77 @@ controlServer.on('connection', (ws) => {
                 pending.res.end(decodedBody);
             }
         }
+
+        if (msg.type === 'ws-connect-response') {
+            const entry = publicWebSockets.get(msg.connectionId);
+            if (!entry) return;
+
+            clearTimeout(entry.timeout);
+            entry.timeout = null;
+            entry.pending = false;
+
+            if (msg.status === 101) {
+                console.log(`[ws] connectionId=${msg.connectionId} established`);
+                for (const frame of entry.buffer) {
+                    try {
+                        ws.send(JSON.stringify({
+                            type: 'ws-frame',
+                            connectionId: msg.connectionId,
+                            isBinary: frame.isBinary,
+                            data: frame.data
+                        }));
+                    } catch (e) {
+                        try { entry.publicWs.close(1011, 'Tunnel send failed'); } catch {}
+                        break;
+                    }
+                }
+                entry.buffer = [];
+            } else {
+                try {
+                    entry.publicWs.close(1011, msg.body ? Buffer.from(msg.body, 'base64').toString() : 'Local server unavailable');
+                } catch {}
+                publicWebSockets.delete(msg.connectionId);
+                tunnelWebSockets.get(subdomain)?.delete(msg.connectionId);
+                console.log(`[ws] connectionId=${msg.connectionId} rejected (status=${msg.status})`);
+            }
+        }
+
+        if (msg.type === 'ws-frame') {
+            const entry = publicWebSockets.get(msg.connectionId);
+            if (!entry) return;
+            try {
+                if (entry.publicWs.readyState === WebSocket.OPEN) {
+                    const buf = Buffer.from(msg.data || '', 'base64');
+                    entry.publicWs.send(buf, { binary: !!msg.isBinary });
+                }
+            } catch (e) {
+                try {
+                    ws.send(JSON.stringify({ type: 'ws-close', connectionId: msg.connectionId, code: 1011, reason: 'Send failed' }));
+                } catch {}
+                publicWebSockets.delete(msg.connectionId);
+                tunnelWebSockets.get(subdomain)?.delete(msg.connectionId);
+            }
+        }
+
+        if (msg.type === 'ws-close') {
+            const entry = publicWebSockets.get(msg.connectionId);
+            if (!entry) return;
+            clearTimeout(entry.timeout);
+            try {
+                if (entry.publicWs.readyState === WebSocket.OPEN || entry.publicWs.readyState === WebSocket.CLOSING) {
+                    entry.publicWs.close(msg.code || 1000, msg.reason || '');
+                }
+            } catch {}
+            publicWebSockets.delete(msg.connectionId);
+            tunnelWebSockets.get(subdomain)?.delete(msg.connectionId);
+            console.log(`[ws] connectionId=${msg.connectionId} closed by client (code=${msg.code})`);
+        }
     });
 });
 
 // --- Public port (4000): Proxy incoming HTTP traffic through the tunnel ---
+const wssPublic = new WebSocket.Server({ noServer: true });
+
 const publicServer = http.createServer((req, res) => {
     res.setHeader('Connection', 'close');
 
@@ -228,6 +409,14 @@ const publicServer = http.createServer((req, res) => {
     });
 });
 
+publicServer.on('upgrade', (req, socket, head) => {
+    if (req.headers['upgrade']?.toLowerCase() !== 'websocket') {
+        socket.destroy();
+        return;
+    }
+    handleWebSocketUpgrade(req, socket, head, wssPublic);
+});
+
 process.on('uncaughtException', (err) => {
     console.error('UNCAUGHT EXCEPTION:', err);
     process.exit(1);
@@ -252,6 +441,19 @@ process.on('SIGTERM', () => {
             } catch {}
         }
         pendingRequests.delete(requestId);
+    }
+
+    for (const [connectionId, entry] of publicWebSockets) {
+        clearTimeout(entry.timeout);
+        try {
+            if (entry.publicWs.readyState === WebSocket.OPEN || entry.publicWs.readyState === WebSocket.CLOSING) {
+                entry.publicWs.close(1011, 'Server restarting');
+            }
+        } catch {}
+        publicWebSockets.delete(connectionId);
+    }
+    for (const connSet of tunnelWebSockets.values()) {
+        connSet.clear();
     }
 
     for (const [, ws] of tunnels) {

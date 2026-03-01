@@ -8,6 +8,8 @@ tunnel 3000
 
 tunnel 3000 --subdomain my-app
 # → https://my-app.yourdomain.com
+
+# WebSocket connections work too — use wss://subdomain.yourdomain.com/ws
 ```
 
 ## Architecture
@@ -147,6 +149,7 @@ tunnel 8080 --subdomain api-dev
 
 ## Features
 
+- **HTTP, HTTPS, and WebSocket tunneling** — Same subdomain and port for all traffic; WebSocket upgrade requests are proxied bidirectionally
 - Token-based authentication (timing-safe comparison, sent as first WebSocket message)
 - Wildcard subdomain routing with persistent subdomain support
 - Binary-safe request/response proxying (Base64 over JSON)
@@ -166,3 +169,5 @@ tunnel 8080 --subdomain api-dev
 | Auth timeout | 5 seconds |
 | Max WebSocket payload | 16MB (accommodates Base64 inflation) |
 | Heartbeat interval | 30 seconds |
+| Max WebSocket connections per tunnel | 50 |
+| WebSocket connect timeout | 10 seconds |
