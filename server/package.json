@@ -1,0 +1,12 @@
+{
+  "name": "tunnel-server",
+  "version": "1.0.0",
+  "description": "Self-hosted tunnel server — accepts authenticated WebSocket connections and proxies public HTTP traffic through them",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

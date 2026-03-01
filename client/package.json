@@ -1,0 +1,15 @@
+{
+  "name": "tunnel-client",
+  "version": "1.0.0",
+  "description": "CLI client that creates a secure tunnel from localhost to the public internet via a self-hosted tunnel server",
+  "main": "client.js",
+  "bin": {
+    "tunnel": "./client.js"
+  },
+  "scripts": {
+    "start": "node client.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
