@@ -1,0 +1,20 @@
+{
+  "name": "client",
+  "version": "1.0.0",
+  "description": "Reverse tunnel local client CLI",
+  "main": "client.js",
+  "scripts": {
+    "start": "node client.js",
+    "start:example": "node client.js 3000"
+  },
+  "keywords": [
+    "tunnel",
+    "cli",
+    "websocket"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "ws": "^8.19.0"
+  }
+}
