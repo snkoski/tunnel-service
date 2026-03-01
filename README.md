@@ -33,6 +33,43 @@ Browser → nginx (TLS) → Node public server (:4000) → WebSocket → tunnel 
 
 ## VPS Setup
 
+### Automated setup (recommended)
+
+Clone the repo on your VPS and run the setup script. It handles everything: packages, Node.js, PM2, firewall, SSL cert, nginx, and the server process.
+
+```bash
+git clone <repo-url> && cd tunnel-service
+bash scripts/setup-vps.sh yourdomain.com --cloudflare-token YOUR_CF_TOKEN
+```
+
+The script prints your tunnel secret and the `export` lines to add to your local shell profile when it finishes.
+
+**Options:**
+
+| Flag | Description |
+|------|-------------|
+| `--cloudflare-token <token>` | Cloudflare API token with Zone:DNS:Edit permissions (required for wildcard cert) |
+| `--secret <secret>` | Tunnel auth secret — auto-generated if omitted |
+| `--email <email>` | Email for Let's Encrypt expiry notifications |
+| `--server-dir <path>` | Where to deploy server files (default: `~/tunnel-server`) |
+
+**Prerequisites before running the script:**
+
+- VPS running Ubuntu 22.04 or 24.04
+- DNS A records pointing at your VPS IP:
+  - `yourdomain.com → VPS_IP`
+  - `*.yourdomain.com → VPS_IP`
+- Cloudflare managing your domain (for the wildcard cert DNS challenge)
+
+> If you don't have a Cloudflare token yet, run the script without `--cloudflare-token`. It will set everything else up and print the certbot commands to run manually afterward.
+
+---
+
+### Manual setup steps
+
+<details>
+<summary>Expand if you prefer to run steps individually</summary>
+
 ### 1. Install dependencies
 
 ```bash
@@ -103,6 +140,8 @@ TUNNEL_SECRET=your-generated-secret pm2 start server.js --name tunnel
 pm2 save
 pm2 startup  # follow the printed instruction
 ```
+
+</details>
 
 ## Client Setup
 
